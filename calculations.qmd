@@ -1,0 +1,342 @@
+---
+title: "Analysis plan"
+format: html
+editor: source
+---
+
+```{r, message = F, warning = F, include = F}
+library(tidyverse)
+library(rstatix)
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+if (!requireNamespace("qvalue", quietly = TRUE)) {
+  BiocManager::install("qvalue")
+}
+
+getwd()
+load("df.rda")
+```
+
+![Study design](study_design.png "Fig1")
+
+
+Data frame setup (~1500 peptides, 5 time points, 6 participants)
+```{r}
+df %>% 
+    arrange(peptide, id) %>% 
+    head(10)
+```
+
+Want to measure exchange (release or uptake) based on artery_vein difference and blood flow. Blood flow in particular is important due to the increase during exercise (Fig1 b). Calculation:
+
+![Equation 1](eq.png "Fig2")
+
+Use raw intensities and blood flow (L/min) to calculate exchange with equation 1, followed by log2 transformation.
+
+```{r}
+df_calculated <- df %>% 
+    #Calculate exchange with equation 1
+    dplyr::mutate(exchange = flow * (abundance_a - abundance_v)) %>% 
+    #Log2 transform
+    dplyr::mutate(exchange_log2 = (sign(exchange)) * log2(abs(exchange)))
+
+head(df_calculated, 10)
+```
+
+The first problem: log2-adjusted values are bimodally distributed. No values fall within approx. -10 to 10.
+```{r, warning = F, error = F}
+ggplot(df_calculated, aes(x = exchange_log2))+
+    geom_density()+
+    geom_rug()
+```
+
+Below, statistical test within each peptide and time point: 1-sample t-test to determine whether a each peptide is significantly exchanged:
+```{r}
+results <- df_calculated %>%
+    group_by(peptide, time) %>%
+    rstatix::t_test(exchange_log2 ~ 1, mu=0, detailed=TRUE) %>%
+    dplyr::ungroup() %>% 
+    dplyr::group_by(time) %>% 
+    #Adjust p-values
+    dplyr::mutate(q = qvalue::qvalue(p)$qvalues) %>%
+    dplyr::mutate("-log10p" = -log10(p)) %>% 
+    #Add column with "+" if significant
+    dplyr::mutate(regulated = case_when(q < 0.05 ~ "+"))
+
+```
+
+```{r, echo = F}
+hist(results$p, main = "p-value distribution")
+```
+
+**Results look like this:**
+```{r, echo = F, warning = F, error = F}
+results %>%
+    dplyr::mutate(time = factor(time, levels = c("pre",
+                                                 "baseline",
+                                                 "exercise",
+                                                 "rec60",
+                                                 "rec180"))) %>% 
+    dplyr::mutate(color = case_when(
+        estimate >= 0 & q <= 0.05 ~ "uptake",
+        estimate <= 0 & q <= 0.05 ~ "release",
+        TRUE ~ "unchanged")) %>%
+    dplyr::mutate(label = case_when(
+    regulated == "+" ~ peptide
+    )) %>% 
+    ggplot(aes(x=estimate, y=-log10(p)))+
+    geom_point(aes(color = color, alpha = color), size = 1)+
+    geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.25, color = "gray", alpha = 0.5)+
+    theme(
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "black", fill=NA, linewidth = 0.25),
+        panel.grid.minor=element_blank(),
+        panel.grid.major = element_blank(),
+        plot.background = element_blank(),
+        axis.line = element_blank(),
+        axis.text = element_text(color = "black"),
+        axis.text.x = element_text(),
+        text = element_text(size = 8, color = "black"),
+        legend.title = element_blank(),
+        legend.key = element_blank(),
+        strip.background = element_blank(),
+        legend.position = "none",
+        aspect.ratio = 1)+
+    ylim(0, max(results$`-log10p`)+2)+
+    scale_color_manual(
+        breaks = c("uptake", "release", "unchanged"),
+        values = c(uptake = "#003f5c", release = "#FFB347", unchanged = "gray50"),
+        labels = c(release = "Release", uptake = "Uptake", unchanged = "Unchanged")
+        )+
+    scale_alpha_manual(breaks = c("Uptake", "Release", "Unchanged"),
+                       values=c(1, 1, 0.1))+
+    scale_x_continuous(breaks = scales::pretty_breaks(n = 6))+
+    scale_y_continuous(breaks = scales::pretty_breaks(n = 4))+
+    xlab(expression("Net exchange (log"[2]*"((a - v) \u00D7 plasma flow))")) + 
+    ylab(expression("-log"[10]*"(p-value)")) +
+    facet_grid(cols = vars(time),
+                       labeller = as_labeller(c(pre = "Pre", baseline = "Baseline", exercise = "Exercise", rec60 = "Rec60", rec180 = "Rec180")))
+```
+
+The volcanoes look pretty good. However, I am concerned about the appropriateness of the statistical test. In the above volcano plot, some peptides achieve very low p-values because they are consistently exchange. Because values are distributed so far from 0 on either side, any peptide that is not consistently exchanged in the same direction across participants does not become significant. See the below example:
+
+```{r, echo = F, warning = F, error = F}
+selected_feature <- "SSEEGKLFVGG"
+
+means <- df_calculated %>% 
+    dplyr::filter(peptide == selected_feature) %>% 
+    dplyr::group_by(time) %>% 
+    dplyr::summarize(
+        mean = mean(exchange_log2, na.rm = T)
+    ) %>% 
+    dplyr::ungroup()
+
+df_calculated %>% 
+    dplyr::mutate(time = factor(time, levels = c("pre",
+                                                 "baseline",
+                                                 "exercise",
+                                                 "rec60",
+                                                 "rec180"))) %>% 
+    dplyr::filter(peptide == selected_feature) %>% 
+    ggplot(aes(x = time,
+             y = exchange_log2)) +
+    geom_point(size = 2) +
+    geom_line(data = means, aes(x = time,
+                                y = mean,
+                                group = 1,
+                                color = "red"),
+              linewidth = 1)+
+    geom_line(aes(x = time,
+                  y = exchange_log2,
+                  group = id),
+              color = "gray",
+              alpha = 0.2,
+              linewidth = 1)+
+    geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.25)+
+    theme(
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "black", fill=NA, linewidth = 0.1),
+    panel.grid.minor=element_blank(),
+    panel.grid.major = element_blank(),
+    plot.background = element_rect(fill = "white"),
+    axis.line = element_blank(),
+    axis.text.x = element_text(color = "black", size = 10),
+    axis.text.y = element_text(color = "black", size = 10),
+    axis.ticks = element_line(linewidth = 0.1),
+    axis.title = element_text(size = 10),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    text = element_text(size = 10),
+    legend.title = element_blank(),
+    legend.key = element_blank(),
+    strip.background = element_blank(),
+    legend.position = "none"
+    )+
+    scale_x_discrete(labels = c(pre = "Pre", baseline = "Baseline", exercise = "Exercise", rec60 = "Rec60", rec180 = "Rec180"))+
+    labs(y = "Exchange (log2)",
+       x = NULL,
+       title = selected_feature)
+```
+
+SSEEGKLFVGG is the most significantly peptide of all. It is significant at Baseline and at Rec60, but not at Pre (where one participant breaks the pattern). 
+
+Another issue is the logical one, where it should be possible to no exchange (i.e., exchange = 0).
+
+# Potential solution
+
+It seems that the reason for the bimodal distribution of log2 exchange values is that the raw exchange values are very high. This can be circumvented by dividing abundance values by 1e6 (which I chose by trial and error - so somewhat arbitrarily). The code:
+
+```{r}
+df_with_division <- df %>% 
+    #Divide arterial and venous abundances to make them smaller
+    dplyr::mutate(abundance_a_smaller = abundance_a/1e6) %>% 
+    dplyr::mutate(abundance_v_smaller = abundance_v/1e6) %>% 
+    #Calculate exchange
+    dplyr::mutate(exchange = flow * (abundance_a_smaller - abundance_v_smaller)) %>% 
+    #To avoid values betwween -1 and 1
+    dplyr::mutate(exchange_for_log2 = ifelse(exchange > 0, exchange + 1, exchange - 1)) %>%
+    #Log2 transform
+    dplyr::mutate(exchange_log2 = (sign(exchange)) * log2(abs(exchange_for_log2)))
+    
+```
+
+Distribution now looks more normal:
+```{r, echo = F}
+ggplot(df_with_division, aes(x = exchange_log2))+
+    geom_density()+
+    geom_rug()
+```
+
+Below, I run a one-sample t-test again:
+```{r}
+results_with_division <- df_with_division %>%
+    group_by(peptide, time) %>%
+    rstatix::t_test(exchange_log2 ~ 1, mu=0, detailed=TRUE) %>%
+    dplyr::ungroup() %>% 
+    dplyr::group_by(time) %>% 
+    #Adjust p-values
+    dplyr::mutate(q = qvalue::qvalue(p)$qvalues) %>%
+    dplyr::mutate("-log10p" = -log10(p)) %>% 
+    #Add column with "+" if significant
+    dplyr::mutate(regulated = case_when(q < 0.05 ~ "+"))
+```
+
+```{r, echo = F}
+hist(results_with_division$p, main = "p-value distribution")
+```
+
+**Results now look like this:** 
+```{r, echo = F}
+results_with_division %>%
+    dplyr::mutate(time = factor(time, levels = c("pre",
+                                                 "baseline",
+                                                 "exercise",
+                                                 "rec60",
+                                                 "rec180"))) %>% 
+    dplyr::mutate(color = case_when(
+        estimate >= 0 & q <= 0.05 ~ "uptake",
+        estimate <= 0 & q <= 0.05 ~ "release",
+        TRUE ~ "unchanged")) %>%
+    dplyr::mutate(label = case_when(
+    regulated == "+" ~ peptide
+    )) %>% 
+    ggplot(aes(x=estimate, y=-log10(p)))+
+    geom_point(aes(color = color, alpha = color), size = 1)+
+    geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.25, color = "gray", alpha = 0.5)+
+    theme(
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "black", fill=NA, linewidth = 0.25),
+        panel.grid.minor=element_blank(),
+        panel.grid.major = element_blank(),
+        plot.background = element_blank(),
+        axis.line = element_blank(),
+        axis.text = element_text(color = "black"),
+        axis.text.x = element_text(),
+        text = element_text(size = 8, color = "black"),
+        legend.title = element_blank(),
+        legend.key = element_blank(),
+        strip.background = element_blank(),
+        legend.position = "none",
+        aspect.ratio = 1)+
+    ylim(0, max(results$`-log10p`)+2)+
+    scale_color_manual(
+        breaks = c("uptake", "release", "unchanged"),
+        values = c(uptake = "#003f5c", release = "#FFB347", unchanged = "gray50"),
+        labels = c(release = "Release", uptake = "Uptake", unchanged = "Unchanged")
+        )+
+    scale_alpha_manual(breaks = c("Uptake", "Release", "Unchanged"),
+                       values=c(1, 1, 0.1))+
+    scale_x_continuous(breaks = scales::pretty_breaks(n = 6))+
+    scale_y_continuous(breaks = scales::pretty_breaks(n = 4))+
+    xlab(expression("Net exchange (log"[2]*"((a - v) \u00D7 plasma flow))")) + 
+    ylab(expression("-log"[10]*"(p-value)")) +
+    facet_grid(cols = vars(time),
+                       labeller = as_labeller(c(pre = "Pre", baseline = "Baseline", exercise = "Exercise", rec60 = "Rec60", rec180 = "Rec180")))
+```
+The above volcanoes look more like one would expect a volcano plot to look (compared to the previous volcanoes in which dots create almost a U-shape). Less peptides are significant, which is ok.
+
+**Line plot**
+```{r, echo = F}
+selected_feature <- "SSEEGKLFVGG"
+
+means <- df_with_division %>% 
+    dplyr::filter(peptide == selected_feature) %>% 
+    dplyr::group_by(time) %>% 
+    dplyr::summarize(
+        mean = mean(exchange_log2, na.rm = T)
+    ) %>% 
+    dplyr::ungroup()
+
+df_with_division %>% 
+    dplyr::mutate(time = factor(time, levels = c("pre",
+                                                 "baseline",
+                                                 "exercise",
+                                                 "rec60",
+                                                 "rec180"))) %>% 
+    dplyr::filter(peptide == selected_feature) %>% 
+    ggplot(aes(x = time,
+             y = exchange_log2)) +
+    geom_point(size = 2) +
+    geom_line(data = means, aes(x = time,
+                                y = mean,
+                                group = 1,
+                                color = "red"),
+              linewidth = 1)+
+    geom_line(aes(x = time,
+                  y = exchange_log2,
+                  group = id),
+              color = "gray",
+              alpha = 0.2,
+              linewidth = 1)+
+    geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.25)+
+    theme(
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "black", fill=NA, linewidth = 0.1),
+    panel.grid.minor=element_blank(),
+    panel.grid.major = element_blank(),
+    plot.background = element_rect(fill = "white"),
+    axis.line = element_blank(),
+    axis.text.x = element_text(color = "black", size = 10),
+    axis.text.y = element_text(color = "black", size = 10),
+    axis.ticks = element_line(linewidth = 0.1),
+    axis.title = element_text(size = 10),
+    axis.title.x = element_text(size = 10),
+    axis.title.y = element_text(size = 10),
+    text = element_text(size = 10),
+    legend.title = element_blank(),
+    legend.key = element_blank(),
+    strip.background = element_blank(),
+    legend.position = "none"
+    )+
+    scale_x_discrete(labels = c(pre = "Pre", baseline = "Baseline", exercise = "Exercise", rec60 = "Rec60", rec180 = "Rec180"))+
+    labs(y = "Exchange (log2)",
+       x = NULL,
+       title = selected_feature)
+```
+
+SSEEGKLFVGG is now only significant at Rec60 and looks relatively normal distributed for all time points.
+
+This approach of dividing raw intensities by 1e6 looks more correct to me, but it is chosen almost at random. Dividing by 1e7 yields yet other results. Maybe there is a more appropriate scaling method.
