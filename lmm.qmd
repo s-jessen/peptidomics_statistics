@@ -1,0 +1,34 @@
+---
+title: "Analysis plan"
+format: html
+editor: source
+---
+
+```{r, message = F, warning = F, include = F}
+library(tidyverse)
+library(rstatix)
+
+getwd()
+load("df.rda")
+load("df_long_peptidomics.rda")
+```
+
+
+```{r}
+#Retrieve long format
+long <- df_long_peptidomics %>%
+    #Reverse log2 transformation
+    dplyr::mutate(abundance = 2^abundance) %>% 
+    #Make values smaller
+    dplyr::mutate(abundance = abundance/1e6) %>% 
+    #filter for 1 peptide at exercise time point
+    dplyr::filter(peptide == "AAAIEAAAKKLE" & time == "exercise") %>% 
+    dplyr::select(-c("time_num", "hb"))
+
+#Analyze
+lmm <- lmer(log(abundance) ~ site*flow + (0+site|id), data=long)
+
+summary(lmm)
+
+```
+
